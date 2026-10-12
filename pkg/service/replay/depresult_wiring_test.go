@@ -183,9 +183,9 @@ func TestRunTestSetWiring(t *testing.T) {
 		{
 			name:       "the response diff is un-suppressed through the tested predicate",
 			assignment: "emitFailureLogs",
-			want:       []string{"shouldEmitFailureLogs", "mockSetMismatch", "AssertDependencies"},
-			why: "Reverting this to `!mockSetMismatch` hands the user a test that --assert-dependencies " +
-				"just marked FAILED with its response diff suppressed as 're-record noise'.",
+			want:       []string{"shouldEmitFailureLogs", "mockSetMismatch", "AssertDependencies", "StrictFailure"},
+			why: "Reverting this to `!mockSetMismatch` hands the user a test that --assert-dependencies or " +
+				"--strict-failure just marked FAILED with its response diff suppressed as 're-record noise'.",
 		},
 		{
 			name:       "the verdict goes through the single seam, carrying the raw response result and all three knobs",

@@ -2679,11 +2679,12 @@ func (r *Replayer) RunTestSet(ctx context.Context, testSetID string, testRunID s
 			r.warnDependencyAssertionInert(testSetID, useMappingBased, isMappingEnabled, instrumentConsumedFetchErr != nil, false, noEligibleDeps, &depAssertionInertWarned)
 
 			// A mock-set mismatch normally means "re-record", so the response
-			// diff is suppressed as noise. With --assert-dependencies the test
-			// is about to be marked FAILED instead of demoted to OBSOLETE, so
-			// suppressing its diffs would hand the user a red test with no
-			// explanation. Knob off (the default) is byte-identical to before.
-			emitFailureLogs := shouldEmitFailureLogs(mockSetMismatch, r.config.Test.AssertDependencies)
+			// diff is suppressed as noise. With --assert-dependencies or
+			// --strict-failure the test is about to be marked FAILED instead of
+			// demoted to OBSOLETE, so suppressing its diffs would hand the user a
+			// red test with no explanation. Knobs off (the default) is
+			// byte-identical to before.
+			emitFailureLogs := shouldEmitFailureLogs(mockSetMismatch, r.config.Test.AssertDependencies, r.config.Test.StrictFailure)
 
 			switch testCase.Kind {
 			case models.HTTP:
