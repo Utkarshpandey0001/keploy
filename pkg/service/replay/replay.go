@@ -3376,7 +3376,7 @@ func (r *Replayer) RunTestSet(ctx context.Context, testSetID string, testRunID s
 			// dependencies and go "missing" at random. Consumers must treat an
 			// absent DepResult as "not available for this run mode", never as
 			// "this test had no dependencies".
-			emitFailureLogs := !mockSetMismatch
+			emitFailureLogs := shouldEmitFailureLogs(mockSetMismatch, r.config.Test.AssertDependencies, r.config.Test.StrictFailure)
 
 			if !ok {
 				// Handle streaming response type
@@ -3488,7 +3488,7 @@ func (r *Replayer) RunTestSet(ctx context.Context, testSetID string, testRunID s
 			if r.instrument && useMappingBased && isMappingEnabled && hasExpectedMocks {
 				mockSetMismatch = !isMockSubsetWithConfig(consumedMocks, expectedMocks)
 				if !hadStreamingMismatch {
-					emitFailureLogs = !mockSetMismatch
+					emitFailureLogs = shouldEmitFailureLogs(mockSetMismatch, r.config.Test.AssertDependencies, r.config.Test.StrictFailure)
 				}
 			}
 
