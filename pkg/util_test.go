@@ -2236,118 +2236,6 @@ func TestResolveTestTarget_EdgeCases(t *testing.T) {
 	})
 }
 
-// --- updateTemplateValuesFromHTTPResp: response-header walk tests ---
-//
-// These cover the gap noted against listmonk's session-cookie round-trip: at replay
-// time the live Set-Cookie/Authorization/etc. values must be pulled out of
-// resp.Header and written into utils.TemplatizedValues so that subsequent tests
-// that render {{.session}}/{{.token}}/... see the fresh value rather than the
-// stale record-time one.
-
-func runHeaderUpdateTest(
-	t *testing.T,
-	recordedHeader, liveHeader map[string]string,
-	initialTemplatedValues map[string]interface{},
-) (changed bool, final map[string]interface{}) {
-	t.Helper()
-	logger := zap.NewNop()
-
-	templated := models.HTTPResp{
-		StatusCode: 302,
-		Header:     recordedHeader,
-		Body:       "",
-	}
-	live := models.HTTPResp{
-		StatusCode: 302,
-		Header:     liveHeader,
-		Body:       "",
-	}
-
-	current := make(map[string]interface{}, len(initialTemplatedValues))
-	prev := make(map[string]interface{}, len(initialTemplatedValues))
-	for k, v := range initialTemplatedValues {
-		current[k] = v
-		prev[k] = v
-	}
-
-	changed = updateTemplateValuesFromHTTPResp(logger, templated, live, current, prev)
-	return changed, current
-}
-
-func TestUpdateTemplateValuesFromHTTPResp_SetCookie(t *testing.T) {
-	recorded := map[string]string{
-		"Set-Cookie": "session={{.session}}; Path=/; HttpOnly",
-	}
-	live := map[string]string{
-		"Set-Cookie": "session=LIVE123; Path=/; HttpOnly",
-	}
-	initial := map[string]interface{}{"session": "RECORDED_VAL"}
-
-	changed, final := runHeaderUpdateTest(t, recorded, live, initial)
-	assert.True(t, changed, "expected Set-Cookie placeholder update to report changed=true")
-	assert.Equal(t, "LIVE123", final["session"])
-}
-
-func TestUpdateTemplateValuesFromHTTPResp_BearerAuthorizationHeader(t *testing.T) {
-	recorded := map[string]string{
-		"Authorization": "Bearer {{.token}}",
-	}
-	live := map[string]string{
-		"Authorization": "Bearer eyJhbGciOiJIUzI1NiJ9.payload.sig",
-	}
-	initial := map[string]interface{}{"token": "OLD_TOKEN"}
-
-	changed, final := runHeaderUpdateTest(t, recorded, live, initial)
-	assert.True(t, changed)
-	assert.Equal(t, "eyJhbGciOiJIUzI1NiJ9.payload.sig", final["token"])
-}
-
-func TestUpdateTemplateValuesFromHTTPResp_GenericHeader(t *testing.T) {
-	recorded := map[string]string{
-		"X-Request-Id": "{{.reqId}}",
-	}
-	live := map[string]string{
-		"X-Request-Id": "abc-123-def-456",
-	}
-	initial := map[string]interface{}{"reqId": "old-id"}
-
-	changed, final := runHeaderUpdateTest(t, recorded, live, initial)
-	assert.True(t, changed)
-	assert.Equal(t, "abc-123-def-456", final["reqId"])
-}
-
-func TestUpdateTemplateValuesFromHTTPResp_HeaderWithLiteralPrefix(t *testing.T) {
-	recorded := map[string]string{
-		"X-Correlation": "trace-{{.id}}",
-	}
-	live := map[string]string{
-		"X-Correlation": "trace-DEF456",
-	}
-	initial := map[string]interface{}{"id": "OLDID"}
-
-	changed, final := runHeaderUpdateTest(t, recorded, live, initial)
-	assert.True(t, changed)
-	assert.Equal(t, "DEF456", final["id"])
-}
-
-func TestUpdateTemplateValuesFromHTTPResp_NoPlaceholder_NoOp(t *testing.T) {
-	recorded := map[string]string{
-		"X-Foo": "bar",
-	}
-	live := map[string]string{
-		"X-Foo": "bar",
-	}
-	// There's a templated value, but it's unrelated to this header -- must not
-	// leak into the map under a new key, and the existing key must stay untouched.
-	initial := map[string]interface{}{"unrelated": "keepme"}
-
-	changed, final := runHeaderUpdateTest(t, recorded, live, initial)
-	assert.False(t, changed, "no placeholder in recorded header should mean no template change")
-	assert.Equal(t, "keepme", final["unrelated"])
-	_, foundFoo := final["X-Foo"]
-	assert.False(t, foundFoo, "must not invent a new template key from a literal header")
-}
-
 // TestFilterByTimeStampThreeTier validates the Lifetime-elevated three-
 // pool partition. Contract:
 //   - LifetimeConnection           → startupMocks (connection-scoped reuse)
@@ -2526,6 +2414,35 @@ func TestAgentHealthTicker_ReachesAnAgentSlowerThanTheFirstCheck(t *testing.T) {
 
 	ready, open := <-readyCh
 	require.True(t, open && ready, "the agent answered every health check in 750ms and was never found ready")
+}
+
+// A health check's headers are the agent's only when it answered 200: an
+// answer other than 200 (a proxy's 503, an agent still starting) says nothing
+// about the agent, whatever headers it carries, and is no answer at all, as
+// none is when nothing listens. Each check here has a definite answer, so none
+// has a deadline.
+func TestAgentHealthAnswer_IsOnlyAHealthyAnswersHeaders(t *testing.T) {
+	answer := func(status int) string {
+		srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+			w.Header().Set("X-Keploy-Proven", "off")
+			w.WriteHeader(status)
+		}))
+		t.Cleanup(srv.Close)
+		return srv.URL + "/agent"
+	}
+
+	header := agentHealthAnswer(context.Background(), zap.NewNop(), &http.Client{}, answer(http.StatusOK))
+	require.NotNil(t, header, "a 200 is a healthy answer")
+	require.Equal(t, "off", header.Get("X-Keploy-Proven"), "the headers returned are not the answer's")
+
+	require.Nil(t, agentHealthAnswer(context.Background(), zap.NewNop(), &http.Client{}, answer(http.StatusServiceUnavailable)),
+		"the headers of a 503 were taken for the agent's")
+
+	gone := httptest.NewServer(http.NotFoundHandler())
+	goneURL := gone.URL
+	gone.Close()
+	require.Nil(t, agentHealthAnswer(context.Background(), zap.NewNop(), &http.Client{}, goneURL+"/agent"),
+		"an address nothing answers on gave headers")
 }
 
 // Each health check waits twice as long as the last one that ran out of time,

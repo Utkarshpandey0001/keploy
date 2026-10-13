@@ -86,6 +86,8 @@ type composeInstr struct {
 	events     []string
 	runs       int
 	healthHits int
+	// stored is every mock StoreMocks was sent.
+	stored []*models.Mock
 }
 
 func newInstr(t *testing.T, lifetime agentLifetime, runBlocks bool, runResult models.AppError) *composeInstr {
@@ -105,7 +107,7 @@ func newInstr(t *testing.T, lifetime agentLifetime, runBlocks bool, runResult mo
 		f.mu.Unlock()
 		if !f.agentUp() {
 			// In reality nothing is listening at all and the probe gets a
-			// connection refusal; both are "not healthy" to isAgentHealthy,
+			// connection refusal; both are "not healthy" to agentHealthAnswer,
 			// and a served 503 avoids racing a listener open and closed.
 			w.WriteHeader(http.StatusServiceUnavailable)
 			return
@@ -230,8 +232,11 @@ func (f *composeInstr) MakeAgentReadyForDockerCompose(context.Context) error {
 	return nil
 }
 
-func (f *composeInstr) StoreMocks(context.Context, []*models.Mock, []*models.Mock) error {
+func (f *composeInstr) StoreMocks(_ context.Context, filtered, unfiltered []*models.Mock) error {
 	f.record("store")
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	f.stored = append(append(f.stored, filtered...), unfiltered...)
 	return nil
 }
 

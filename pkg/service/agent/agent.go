@@ -18,6 +18,7 @@ import (
 	"go.keploy.io/server/v3/pkg/agent/memoryguard"
 	proxyPkg "go.keploy.io/server/v3/pkg/agent/proxy"
 	httpparser "go.keploy.io/server/v3/pkg/agent/proxy/integrations/http"
+	"go.keploy.io/server/v3/pkg/agent/proxy/integrations/mismatch"
 	"go.keploy.io/server/v3/pkg/agent/proxy/integrations/mocknoise"
 	syncMock "go.keploy.io/server/v3/pkg/agent/proxy/syncMock"
 	pTls "go.keploy.io/server/v3/pkg/agent/proxy/tls"
@@ -199,6 +200,9 @@ func (a *Agent) Setup(ctx context.Context, startCh chan int) error {
 		a.armStopOutcome(path, utils.RegisterPreCancelHook)
 	}
 
+	// The mismatch hints name the command that records this kind of run again.
+	mismatch.SetMockMode(a.config.Agent.MockMode)
+
 	a.logger.Debug("Starting the agent in ", zap.String("mode", string(a.config.Agent.Mode)))
 	errGrp, ctx := errgroup.WithContext(ctx)
 	ctx = context.WithValue(ctx, models.ErrGroupKey, errGrp)
@@ -275,6 +279,16 @@ func (a *Agent) StartIncomingProxy(ctx context.Context, opts models.IncomingOpti
 	// makes the misuse diagnosable instead of crashing the agent process.
 	if a.setupCtx == nil {
 		return nil, errors.New("agent setupCtx is not initialized; ensure Setup() was called before StartIncomingProxy")
+	}
+
+	// A recording's incoming stream attaching begins a recording whose app
+	// is not stopping (incoming stopping.go). The ingress is told its app is
+	// stopping only by a client that started the agent (SetGracefulShutdown),
+	// and such a client's streams never reconnect (they resume only to an
+	// agent docker compose restarts), so an attach here is never one in the
+	// middle of a stop.
+	if s, ok := a.IncomingProxy.(interface{ SetStopping(bool) }); ok {
+		s.SetStopping(false)
 	}
 
 	// IncomingProxy.Start is now idempotent (a sync.Once inside
@@ -393,6 +407,12 @@ func (a *Agent) SetGracefulShutdown(ctx context.Context) error {
 		}()
 	}
 
+	// A recording client that drains after its stop (the route marks ctx so)
+	// stops the app it started before the agent: a connection the app
+	// refuses from here is it gone on purpose (incoming stopping.go).
+	if s, ok := a.IncomingProxy.(interface{ SetStopping(bool) }); ok && models.DrainsAfterStop(ctx) {
+		s.SetStopping(true)
+	}
 	return a.Proxy.SetGracefulShutdown(ctx)
 }
 

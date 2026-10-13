@@ -36,6 +36,9 @@ type IngressHook interface {
 }
 
 type IngressProxyManager struct {
+	// stopping: the recording it serves is stopping, and its app is
+	// stopped on purpose (SetStopping, stopping.go).
+	stopping atomic.Bool
 	mu       sync.Mutex
 	active   map[uint16]proxyStop
 	logger   *zap.Logger
@@ -511,9 +514,8 @@ func (pm *IngressProxyManager) handleConnection(ctx context.Context, clientConn 
 
 		upConn, err := dialIngressTarget(ctx, finalAppAddr, ingressTargetListenTimeout)
 		if err != nil {
-			logger.Error("Failed to connect to upstream gRPC server. Verify that the application is listening on the resolved address and port, and that ingress redirection is configured correctly.",
-				zap.String("final_app_addr", finalAppAddr),
-				zap.Error(err))
+			pm.logAppDialFailure(logger, "Failed to connect to upstream gRPC server. Verify that the application is listening on the resolved address and port, and that ingress redirection is configured correctly.",
+				err, zap.String("final_app_addr", finalAppAddr))
 			clientConn.Close() // Close the client connection as we can't proceed
 			return
 		}
@@ -542,6 +544,14 @@ func newReplayConn(initial []byte, c net.Conn) net.Conn {
 
 func (r *replayConn) Read(p []byte) (int, error) {
 	return r.reader.Read(p)
+}
+
+// CloseWrite half-closes the connection underneath: net.Conn, embedded as an
+// interface, does not promote it. The HTTP/1 ingress ends what it sends with
+// it before it closes a connection whose client may still be sending
+// (lingerClose).
+func (r *replayConn) CloseWrite() error {
+	return util.CloseWriteIfPossible(r.Conn)
 }
 
 func (pm *IngressProxyManager) ServeLive(ctx context.Context, conn net.Conn, upstream string, port uint16) {

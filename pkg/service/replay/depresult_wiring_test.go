@@ -11,12 +11,11 @@ import (
 	"testing"
 )
 
-// RunTestSet is ~2000 lines long and no test executes it: standing up its
-// eight collaborator interfaces (TestDB, MockDB, MappingDB, ReportDB,
-// TestSetConfig, Telemetry, Instrumentation, TestHooks) plus the simulate loop
-// is a harness this slice does not justify. The consequence measured by a
-// reviewer is that the DepResult writer could be replaced with a discard and
-// the whole suite stayed green.
+// RunTestSet is ~2000 lines long, and when this file was written no test
+// executed it. The harnesses that do now (partial_run_runtestset_test.go,
+// templates_runtestset_test.go) drive some of its paths, not every wire
+// below: the consequence measured by a reviewer was that the DepResult writer
+// could be replaced with a discard and the whole suite stayed green.
 //
 // The BEHAVIOUR of every extracted seam is table-tested above
 // (resolveTestOutcome, resolveTestStatus, attachDepResults, buildDepResults,
@@ -183,7 +182,12 @@ func TestRunTestSetWiring(t *testing.T) {
 		{
 			name:       "the response diff is un-suppressed through the tested predicate",
 			assignment: "emitFailureLogs",
-			want:       []string{"shouldEmitFailureLogs", "mockSetMismatch", "AssertDependencies", "StrictFailure"},
+			// assertTestMocks, not AssertDependencies: the knob is read through
+			// r.assertTestMocks(), which answers for --assert-dependencies AND
+			// for the proven switch that turns the assertion on for everyone.
+			// strictFailure, not StrictFailure, likewise preserves the proven
+			// switch while adding the explicit --strict-failure veto.
+			want: []string{"shouldEmitFailureLogs", "mockSetMismatch", "assertTestMocks", "strictFailure"},
 			why: "Reverting this to `!mockSetMismatch` hands the user a test that --assert-dependencies or " +
 				"--strict-failure just marked FAILED with its response diff suppressed as 're-record noise'.",
 		},
@@ -196,8 +200,13 @@ func TestRunTestSetWiring(t *testing.T) {
 			// Naming the raw field here would pin the seam to one spelling and
 			// go quiet the moment a caller sets only the other one — which is
 			// the failure this guard is supposed to catch, not cause.
+			//
+			// assertTestMocks, not AssertDependencies, for the same reason: see
+			// the emitFailureLogs row. strictFailure, not StrictFailure, too:
+			// the veto is read through r.strictFailure(), which answers for the
+			// knob AND for the proven switch that turns it on for everyone.
 			want: []string{"resolveTestOutcome", "testPass", "mockSetMismatch",
-				"NoiseStrict", "AssertDependencies", "StrictFailure"},
+				"NoiseStrict", "assertTestMocks", "strictFailure"},
 			why: "resolveTestOutcome is where --assert-dependencies turns a PASSED-and-green test into a " +
 				"FAILED-and-red one. Passing anything other than the raw testPass and the three knobs " +
 				"silently removes a promotion.",
@@ -219,7 +228,7 @@ func TestRunTestSetWiring(t *testing.T) {
 		{
 			name: "the rows are attached to the persisted result",
 			call: "attachDepResults",
-			want: []string{"testCaseResult", "testStatus", "depAssert", "AssertDependencies"},
+			want: []string{"testCaseResult", "testStatus", "depAssert", "assertTestMocks"},
 			why: "Without this call the rows are computed and thrown away: nothing reaches the report, " +
 				"JUnit, --format json, or the DEPENDENCY_MISSING category.",
 		},
@@ -294,7 +303,7 @@ func TestFailureLogPredicateIsWiredOnEveryReplayPath(t *testing.T) {
 		t.Fatalf("expected three shouldEmitFailureLogs calls in RunTestSet, found %d", len(calls))
 	}
 
-	want := []string{"mockSetMismatch", "AssertDependencies", "StrictFailure"}
+	want := []string{"mockSetMismatch", "assertTestMocks", "strictFailure"}
 	for i, idents := range calls {
 		for _, identifier := range want {
 			if !idents[identifier] {
@@ -304,9 +313,12 @@ func TestFailureLogPredicateIsWiredOnEveryReplayPath(t *testing.T) {
 	}
 }
 
-// The deferred streaming path must NOT write DepResult: its expected-mock list
-// is an un-tier-filtered slice built before the run, so reusable/startup mocks
-// would show up as per-test dependencies and go "missing" at random.
+// The deferred streaming path must NOT write DepResult with the proven switch
+// off: its expected-mock list is an un-tier-filtered slice built before the
+// run, so reusable/startup mocks would show up as per-test dependencies and go
+// "missing" at random. Under the switch it writes them through
+// attachStreamDepResults, which filters that list as the main loop does
+// (eligibleExpectedEntries), and only there.
 func TestStreamingPathDoesNotWriteDepResults(t *testing.T) {
 	_, fn := runTestSetSource(t)
 	if calls := callArgIdents(fn, "buildDepResults"); len(calls) != 1 {
@@ -314,6 +326,18 @@ func TestStreamingPathDoesNotWriteDepResults(t *testing.T) {
 	}
 	if calls := callArgIdents(fn, "attachDepResults"); len(calls) != 1 {
 		t.Fatalf("expected exactly one attachDepResults call in RunTestSet, found %d", len(calls))
+	}
+	pos := posOfCall(t, fn, "attachStreamDepResults")
+	under := false
+	for _, n := range ancestorsOf(fn, pos) {
+		if ifStmt, ok := n.(*ast.IfStmt); ok {
+			if call, ok := ifStmt.Cond.(*ast.CallExpr); ok && calleeName(call) == "provenswitch.On" {
+				under = true
+			}
+		}
+	}
+	if !under {
+		t.Fatal("RunTestSet writes a streamed test's dependency rows outside `if provenswitch.On()`: with the switch off the streaming pass must write none")
 	}
 }
 
@@ -823,8 +847,9 @@ func TestStreamingPassWarnsTheAssertionDidNotRun(t *testing.T) {
 	calls := callArgIdents(fn, warner)
 	if len(calls) != 2 {
 		t.Fatalf("RunTestSet calls %s %d time(s), want 2 (the main replay loop and the deferred streaming pass).\n\n"+
-			"WHY THIS MATTERS: the streaming pass runs no dependency assertion at all. Without its own "+
-			"call, --assert-dependencies over a set of SSE/chunked tests is silently inert and exits 0.",
+			"WHY THIS MATTERS: the streaming pass runs no --assert-dependencies assertion (under "+
+			"KEPLOY_PROVEN=1 it judges only its test mocks, proven_verdicts.go). Without its own call, "+
+			"--assert-dependencies over a set of SSE/chunked tests is silently inert and exits 0.",
 			warner, len(calls))
 	}
 
@@ -947,7 +972,7 @@ func TestMainLoopReportsTheConsumedFetchOutcomeToTheWarner(t *testing.T) {
 
 // THE ELIGIBILITY FILTER IS ONE FUNCTION, NOT TWO COPIES.
 //
-// `isDNSMockEntry(m, kinds) || reusable[m.Name]` decides two things that must
+// `isUnassertedMockEntry(m, kinds) || reusable[m.Name]` decides two things that must
 // agree: the persisted deps_checked bit (buildDepResults iterates the survivors)
 // and the user-facing "why nothing was asserted" warning (RunTestSet measures
 // them for noEligibleDeps, via filteredExpectedNames). It used to be written
@@ -985,10 +1010,10 @@ func TestEligibilityFilterHasExactlyOneDefinition(t *testing.T) {
 					if !ok || bin.Op != token.LOR {
 						return true
 					}
-					// The composite predicate: a call to isDNSMockEntry on one
-					// side, an index into the reusable map on the other.
+					// The composite predicate: a call to isUnassertedMockEntry on
+					// one side, an index into the reusable map on the other.
 					idents := exprIdents([]ast.Expr{bin})
-					if idents["isDNSMockEntry"] && idents["reusableMockNames"] {
+					if idents["isUnassertedMockEntry"] && idents["reusableMockNames"] {
 						sites = append(sites, site{fn: fn.Name.Name, pos: fset.Position(bin.Pos()).String()})
 					}
 					return true

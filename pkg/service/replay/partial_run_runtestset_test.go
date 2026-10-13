@@ -92,6 +92,12 @@ type prMappingDB struct {
 	existsCalls int
 	// last is the mapping of the last Insert.
 	last *models.Mapping
+	// onDisk is the per-test mapping Get reports, and onDiskStartup the
+	// startup section GetStartup reports, as the file on disk holds them;
+	// none by default. getCalls counts the reads of the per-test mapping.
+	onDisk        map[string][]models.MockEntry
+	onDiskStartup []models.MockEntry
+	getCalls      int
 }
 
 func (m *prMappingDB) Insert(_ context.Context, mapping *models.Mapping) error {
@@ -101,10 +107,17 @@ func (m *prMappingDB) Insert(_ context.Context, mapping *models.Mapping) error {
 	m.last = mapping
 	return nil
 }
-func (*prMappingDB) Get(context.Context, string) (map[string][]models.MockEntry, bool, error) {
-	return nil, false, nil
+func (m *prMappingDB) Get(context.Context, string) (map[string][]models.MockEntry, bool, error) {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	m.getCalls++
+	return m.onDisk, len(m.onDisk) > 0, nil
 }
-func (*prMappingDB) GetStartup(context.Context, string) ([]models.MockEntry, error) { return nil, nil }
+func (m *prMappingDB) GetStartup(context.Context, string) ([]models.MockEntry, error) {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	return m.onDiskStartup, nil
+}
 func (m *prMappingDB) Exists(context.Context, string) (bool, error) {
 	m.mu.Lock()
 	defer m.mu.Unlock()
@@ -154,7 +167,16 @@ func (f *prReportDB) GetTestCaseResults(context.Context, string, string) ([]mode
 func (f *prReportDB) GetReport(context.Context, string, string) (*models.TestReport, error) {
 	return nil, nil
 }
-func (f *prReportDB) ClearTestCaseResults(context.Context, string, string) {}
+
+// ClearTestCaseResults drops every result kept, as the YAML report store
+// (reportdb) does. Replayer.Start clears the run's results before every
+// attempt at a test set, so a --must-pass or flaky-check rerun reads only its
+// own results.
+func (f *prReportDB) ClearTestCaseResults(context.Context, string, string) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	f.results = nil
+}
 func (f *prReportDB) InsertTestCaseResult(_ context.Context, _ string, _ string, r *models.TestResult) error {
 	f.mu.Lock()
 	defer f.mu.Unlock()
@@ -226,6 +248,10 @@ type prInstr struct {
 	// returns.
 	release chan struct{}
 	stopped chan struct{}
+	// mockErrorsFor, when set, answers every GetMockErrors call: what the agent
+	// read of the calls no mock answered during the test that just ran. The
+	// replayer reads them once per test, in test order.
+	mockErrorsFor func() ([]models.UnmatchedCall, error)
 }
 
 func (f *prInstr) AgentReadsConsumedPerTestOnly() bool {
@@ -265,13 +291,21 @@ func (f *prInstr) Run(ctx context.Context, _ models.RunOptions) models.AppError 
 	}
 }
 func (f *prInstr) GetErrorChannel() <-chan error                                    { return make(chan error) }
-func (f *prInstr) GetMockErrors(context.Context) ([]models.UnmatchedCall, error)    { return nil, nil }
+func (f *prInstr) GetMockErrors(context.Context) ([]models.UnmatchedCall, error)    { return f.errs() }
 func (f *prInstr) BeforeSimulate(context.Context, *time.Time, string, string) error { return nil }
 func (f *prInstr) AfterSimulate(context.Context, string, string) error              { return nil }
 func (f *prInstr) BeforeTestRun(context.Context, string) error                      { return nil }
 func (f *prInstr) BeforeTestSetCompose(context.Context, string, string, bool) error { return nil }
 func (f *prInstr) AfterTestRun(context.Context, string, []string, models.TestCoverage) error {
 	return nil
+}
+
+// errs answers GetMockErrors: mockErrorsFor when a test set it, else no miss.
+func (f *prInstr) errs() ([]models.UnmatchedCall, error) {
+	if f.mockErrorsFor != nil {
+		return f.mockErrorsFor()
+	}
+	return nil, nil
 }
 func (f *prInstr) StoreMocks(_ context.Context, filtered []*models.Mock, unfiltered []*models.Mock) error {
 	f.mu.Lock()

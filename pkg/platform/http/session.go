@@ -73,6 +73,7 @@ const (
 	stepStoreMocks   = "store-mocks"
 	stepMockParams   = "update-mock-params"
 	stepScopeTable   = "scope-table"
+	stepSetTable     = "set-table"
 	stepScopeGate    = "scope-gate"
 	stepAgentReady   = "agent-ready"
 )
@@ -477,6 +478,7 @@ func (a *AgentClient) reopenStream(ctx context.Context, name, method, path strin
 		if method == http.MethodPost {
 			req.Header.Set("Content-Type", "application/json")
 		}
+		a.markDrainsAfterStop(ctx, req)
 		res, err := a.client.Do(req)
 		if err == nil {
 			if err := agentStreamStatus(name, res); err != nil {

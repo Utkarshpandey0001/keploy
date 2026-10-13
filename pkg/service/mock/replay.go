@@ -212,6 +212,11 @@ func (m *mockService) Replay(ctx context.Context) (err error) {
 		utils.LogError(m.logger, err, "failed to load "+failedPool+" mocks", zap.String("mock-set", name))
 		return err
 	}
+	// What the agent holds: the pools less what this keploy never sends it
+	// (models.AgentBound: the connection failures, which it does not replay).
+	// loaded counts exactly that, for the empty-set WARN, the "verified
+	// nothing" exit, the receipt and the metered count.
+	filtered, unfiltered = models.AgentBound(filtered), models.AgentBound(unfiltered)
 	loaded := len(filtered) + len(unfiltered)
 	// The recording this run replays, for the receipt: read after Pull, so in
 	// enterprise it is the registry's copy that was actually served.
@@ -307,7 +312,8 @@ func (m *mockService) Replay(ctx context.Context) (err error) {
 		appErr = models.AppError{AppErrorType: models.ErrInternal, Err: context.Cause(ctx)}
 	}
 	if actual != nil {
-		m.drainTrailingMocks(actual.done, time.Now(), func() (uint64, bool) { return uint64(actual.seen.Load()), false })
+		m.drainTrailingMocks(actual.done, time.Now(), false, func() (uint64, bool) { return uint64(actual.seen.Load()), false },
+			func() uint64 { return uint64(actual.seen.Load()) })
 	}
 	stopWatch()
 	actual.wait(mockDrainStall)
@@ -573,14 +579,27 @@ func (m *mockService) persistCaptured(ctx context.Context, name string) {
 	// without this the replay-side counter starts at 0 and appended mocks reuse
 	// mock-0, mock-1, … colliding with the recorded set (consumed-mock tracking
 	// and mappings both key on name).
-	m.mockDB.SetCounterID(m.highestMockIndex(ctx, name))
+	//
+	// A set that cannot be read cannot be numbered: numbering from the start
+	// would give the appended mocks names already in the file, so nothing is
+	// appended.
+	highest, err := m.highestMockIndex(ctx, name)
+	if err != nil {
+		utils.LogError(m.logger, err, "the calls captured on miss were not added to the mock set: it could not be read to number them, and numbering from the start would reuse the names of mocks already in it",
+			zap.String("mock-set", name), zap.Int("captured", len(captured)),
+			zap.String("next_step", "fix the mock set so it loads (the error says why), then run again with --on-miss record to capture these calls"))
+		return
+	}
+	m.mockDB.SetCounterID(highest)
 	appended := 0
 	for _, mk := range captured {
 		if mk == nil {
 			continue
 		}
 		if err := m.mockDB.InsertMock(ctx, mk, name); err != nil {
-			m.logger.Debug("failed to append a captured-on-miss mock", zap.Error(err))
+			utils.LogError(m.logger, err, "failed to add a call captured on miss to the mock set; it is not saved",
+				zap.String("mock-set", name),
+				zap.String("next_step", "run again with --on-miss record to capture it"))
 			continue
 		}
 		appended++
@@ -621,33 +640,49 @@ func (m *mockService) loadMocks(ctx context.Context, name string, mapped map[str
 
 // highestMockIndex returns the largest N across the set's existing "mock-N"
 // names, or -1 when the set is empty / has no mock-N names. Seeding the counter
-// to this value makes the next InsertMock name its mock "mock-<N+1>".
-func (m *mockService) highestMockIndex(ctx context.Context, name string) int64 {
+// to this value makes the next InsertMock name its mock "mock-<N+1>". It fails
+// when the set cannot be read.
+func (m *mockService) highestMockIndex(ctx context.Context, name string) (int64, error) {
 	all := map[string]bool{}
 	var filtered, unfiltered []*models.Mock
+	var skipped map[string]models.Kind
 	if reader, ok := m.mockDB.(pkg.TestSetMocksReader); ok {
-		set, _ := reader.GetTestSetMocks(ctx, name, models.BaseTime, time.Now(), all, all)
-		filtered, unfiltered = set.Filtered, set.Unfiltered
+		set, err := reader.GetTestSetMocks(ctx, name, models.BaseTime, time.Now(), all, all)
+		if err != nil {
+			return -1, err
+		}
+		filtered, unfiltered, skipped = set.Filtered, set.Unfiltered, set.Skipped
 	} else {
-		filtered, _ = m.mockDB.GetFilteredMocks(ctx, name, models.BaseTime, time.Now(), all, all)
-		unfiltered, _ = m.mockDB.GetUnFilteredMocks(ctx, name, models.BaseTime, time.Now(), all, all)
+		var err error
+		if filtered, err = m.mockDB.GetFilteredMocks(ctx, name, models.BaseTime, time.Now(), all, all); err != nil {
+			return -1, err
+		}
+		if unfiltered, err = m.mockDB.GetUnFilteredMocks(ctx, name, models.BaseTime, time.Now(), all, all); err != nil {
+			return -1, err
+		}
 	}
 	highest := int64(-1)
-	consider := func(mocks []*models.Mock) {
-		for _, mk := range mocks {
-			if mk == nil {
-				continue
-			}
-			if n, ok := strings.CutPrefix(mk.Name, "mock-"); ok {
-				if idx, err := strconv.ParseInt(n, 10, 64); err == nil && idx > highest {
-					highest = idx
-				}
+	consider := func(name string) {
+		if n, ok := strings.CutPrefix(name, "mock-"); ok {
+			if idx, err := strconv.ParseInt(n, 10, 64); err == nil && idx > highest {
+				highest = idx
 			}
 		}
 	}
-	consider(filtered)
-	consider(unfiltered)
-	return highest
+	for _, mocks := range [][]*models.Mock{filtered, unfiltered} {
+		for _, mk := range mocks {
+			if mk != nil {
+				consider(mk.Name)
+			}
+		}
+	}
+	// A document the decoders skipped (a kind this keploy cannot read, a
+	// connection failure it cannot replay) is still in the file under its
+	// name, which an appended mock must not take.
+	for name := range skipped {
+		consider(name)
+	}
+	return highest, nil
 }
 
 // pushScopeTable reads mappings.yaml for the set (if per-test mappings exist)
@@ -847,16 +882,16 @@ func (m *mockService) pushSetTable(ctx context.Context, name string) bool {
 		return false
 	}
 	mapping, err := reader.GetMapping(ctx, name)
-	if err != nil || mapping == nil || len(mapping.Boots) == 0 {
+	if err != nil || mapping == nil || (len(mapping.Boots) == 0 && len(mapping.Suites) == 0) {
 		return false
 	}
 	root := gitTop()
 	sets := setTable(mapping, root)
 	if err := pusher.PushSetTable(ctx, root, sets); err != nil {
-		m.logger.Warn("could not install the app start table; app starts are not kept apart in this run", zap.Error(err))
+		m.logger.Warn("could not send the agent each set's mocks and recorded start; using the per-test mocks instead", zap.Error(err))
 		return false
 	}
-	m.logger.Info("app starts kept apart", zap.Int("sets", len(sets)), zap.String("mock-set", name))
+	m.logger.Info("sent the agent each set's mocks and recorded start", zap.Int("sets", len(sets)), zap.String("mock-set", name))
 	return true
 }
 
@@ -891,6 +926,13 @@ func setTable(mapping *models.Mapping, root string) map[string]models.SetTable {
 		}
 		st.Tests[tc.ID] = owned
 		sets[setName(tc.Dir, root)] = st
+	}
+	for _, su := range mapping.Suites {
+		k := setName(su.Dir, root)
+		if st, ok := sets[k]; ok && !su.Start.IsZero() && (st.Start.IsZero() || su.Start.Before(st.Start)) {
+			st.Start = su.Start
+			sets[k] = st
+		}
 	}
 	return sets
 }
@@ -999,6 +1041,11 @@ func (m *mockService) reportOutcome(ctx context.Context, loaded int, detail repl
 	if fromCompose {
 		outcome, err := composeOutcome.ComposeAgentOutcome()
 		consumed, misses, consumedErr, missesErr = outcome.Consumed, outcome.Missed, err, err
+		if err == nil && outcome.MissedUnread != "" {
+			// As the agent's own read would have said it: incomplete, with
+			// what was read.
+			missesErr = fmt.Errorf("%w: %s", models.ErrUnmatchedCallsUnread, outcome.MissedUnread)
+		}
 	} else {
 		outcomeCtx, cancel := context.WithTimeout(ctx, agentEpilogueTimeout)
 		defer cancel()
@@ -1054,7 +1101,13 @@ func (m *mockService) reportOutcome(ctx context.Context, loaded int, detail repl
 		m.logger.Info("mock replay summary", summary...)
 	} else {
 		next := "check the agent logs for why it stopped before the run ended"
-		if fromCompose {
+		if fromCompose && consumedErr == nil {
+			// The agent left its account, but its read of the calls no mock
+			// answered was incomplete (the proven switch): that is what to
+			// look into.
+			summary = append(summary, zap.NamedError("reason", missesErr))
+			next = "the keploy-agent container could not read every call no mock answered as compose stopped it; check its logs above for why"
+		} else if fromCompose {
 			// Compose stopping the agent is the normal end of the run, not
 			// the thing to look into: the agent writes its account as it
 			// stops, and what needs explaining is why this one did not.
